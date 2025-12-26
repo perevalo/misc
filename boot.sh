@@ -26,6 +26,8 @@ set -euo pipefail
 #   "workflow": { ... ComfyUI prompt graph ... },
 #   "output_prefix": "talia_daily"
 # }
+echo "BOOT_START $(date -Is)"
+echo "BOOT_SCRIPT_URL=${BOOT_SCRIPT_URL:-}"
 
 log() { echo "[$(date -Is)] $*"; }
 
