@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stateless ComfyUI boot script (intended to be fetched and piped to bash)
-# - Works with RunPod "runpod-slim" images where ComfyUI lives in /workspace/runpod-slim/ComfyUI
-# - Uses ComfyUI venv python if present
-# - Ensures comfyui-frontend-package is installed (frontend is a pip package now) :contentReference[oaicite:0]{index=0}
+# Stateless ComfyUI boot script (fetched via curl | bash)
+# Designed for RunPod images that may auto-start ComfyUI.
+# Behavior:
+# - Detects ComfyUI location
+# - Stops any auto-started ComfyUI
+# - Updates ComfyUI repo (optional)
+# - Installs requirements into the ComfyUI venv (if present)
+# - Ensures comfyui-frontend-package is installed/upgraded
+# - Starts ComfyUI
+# - Optionally runs one JOB_ID (pull job JSON from Supabase Storage, sync assets, run workflow, upload outputs)
 #
-# Required env vars (only needed if you want job + storage sync):
+# REQUIRED (only if using job + storage sync):
 #   SUPABASE_URL
 #   SUPABASE_SERVICE_ROLE_KEY
-# Optional:
+#
+# OPTIONAL:
 #   JOB_ID
 #   COMFYUI_PORT (default 8188)
 #   COMFYUI_REF  (git ref, default "master")
@@ -18,7 +25,7 @@ set -euo pipefail
 #   SUPABASE_BUCKET_JOBS   (default "jobs")
 #   SUPABASE_BUCKET_OUTPUTS(default "outputs")
 #
-# Job JSON format (Supabase Storage object: jobs/<JOB_ID>.json):
+# Job JSON (Supabase Storage object: jobs/<JOB_ID>.json):
 # {
 #   "id": "job_123",
 #   "models": [{"bucket":"models","path":"checkpoints/sdxl.safetensors","target":"models/checkpoints/sdxl.safetensors"}],
@@ -26,10 +33,11 @@ set -euo pipefail
 #   "workflow": { ... ComfyUI prompt graph ... },
 #   "output_prefix": "talia_daily"
 # }
-echo "BOOT_START $(date -Is)"
-echo "BOOT_SCRIPT_URL=${BOOT_SCRIPT_URL:-}"
 
 log() { echo "[$(date -Is)] $*"; }
+
+log "BOOT_START $(date -Is)"
+log "BOOT_SCRIPT_URL=${BOOT_SCRIPT_URL:-}"
 
 COMFYUI_PORT="${COMFYUI_PORT:-8188}"
 COMFYUI_REF="${COMFYUI_REF:-master}"
@@ -39,7 +47,7 @@ SUPABASE_BUCKET_LORAS="${SUPABASE_BUCKET_LORAS:-loras}"
 SUPABASE_BUCKET_JOBS="${SUPABASE_BUCKET_JOBS:-jobs}"
 SUPABASE_BUCKET_OUTPUTS="${SUPABASE_BUCKET_OUTPUTS:-outputs}"
 
-# Locate ComfyUI directory (covers RunPod slim and other images)
+# Locate ComfyUI directory
 if [[ -d "/workspace/runpod-slim/ComfyUI" ]]; then
   COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
 elif [[ -d "/workspace/ComfyUI" ]]; then
@@ -56,39 +64,44 @@ else
   PY="python3"
 fi
 
-# Ensure basic tooling exists
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing command: $1"; exit 1; }; }
 need_cmd curl
 need_cmd jq
 need_cmd git
 
-log "BOOT_START"
 log "COMFYUI_DIR=$COMFYUI_DIR"
 log "PY=$PY"
 log "COMFYUI_PORT=$COMFYUI_PORT"
 log "COMFYUI_REF=$COMFYUI_REF"
 
+# Stop any auto-started ComfyUI (common in some RunPod images)
+if pgrep -f "python.*main.py" >/dev/null 2>&1; then
+  log "Detected running ComfyUI process. Stopping it to apply preflight installs."
+  pkill -f "python.*main.py" || true
+  sleep 2
+fi
+
 # Update ComfyUI repo (if it is a git repo)
 if [[ -d "${COMFYUI_DIR}/.git" ]]; then
   log "Updating ComfyUI repo"
-  git -C "$COMFYUI_DIR" fetch --all --prune
+  git -C "$COMFYUI_DIR" fetch --all --prune || true
+
   if git -C "$COMFYUI_DIR" show-ref --verify --quiet "refs/heads/${COMFYUI_REF}"; then
     git -C "$COMFYUI_DIR" checkout -f "$COMFYUI_REF"
     git -C "$COMFYUI_DIR" pull --ff-only || true
   else
-    # supports branch names like master, main, or tags/commit SHAs
+    # branch/tag/commit SHA
     git -C "$COMFYUI_DIR" checkout -f "$COMFYUI_REF" || git -C "$COMFYUI_DIR" checkout -f "origin/$COMFYUI_REF"
   fi
 else
   log "ComfyUI is not a git repo, skipping git update"
 fi
 
-# Install requirements using the same python environment ComfyUI runs with
+# Install requirements in the same environment ComfyUI uses
 log "Installing ComfyUI requirements"
 "$PY" -m pip install -r "${COMFYUI_DIR}/requirements.txt"
 
-# Ensure the frontend package is present and up to date
-# ComfyUI frontend is shipped as a separate pip package now :contentReference[oaicite:1]{index=1}
+# Ensure the ComfyUI frontend package is installed/upgraded (frontend is a pip package now)
 log "Ensuring comfyui-frontend-package is installed"
 "$PY" -m pip install --upgrade comfyui-frontend-package
 
@@ -97,7 +110,7 @@ log "Starting ComfyUI"
 cd "$COMFYUI_DIR"
 nohup "$PY" main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" > /workspace/comfyui.log 2>&1 &
 
-# Wait for ComfyUI to be ready
+# Wait for readiness
 log "Waiting for ComfyUI readiness"
 for i in $(seq 1 240); do
   if curl -sS "http://127.0.0.1:${COMFYUI_PORT}/system_stats" >/dev/null 2>&1; then
@@ -113,14 +126,14 @@ if ! curl -sS "http://127.0.0.1:${COMFYUI_PORT}/system_stats" >/dev/null 2>&1; t
   exit 1
 fi
 
-# If no job requested, stop here (ComfyUI stays running)
+# If no job requested, stop here
 JOB_ID="${JOB_ID:-}"
 if [[ -z "$JOB_ID" ]]; then
   log "No JOB_ID provided. Boot completed."
   exit 0
 fi
 
-# Supabase helpers (Storage)
+# Supabase required if JOB_ID is set
 if [[ -z "${SUPABASE_URL:-}" || -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   log "ERROR: JOB_ID is set but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are missing"
   exit 1
@@ -183,7 +196,6 @@ JOB_JSON="${TMP_DIR}/job.json"
 log "Fetching job: ${SUPABASE_BUCKET_JOBS}/${JOB_ID}.json"
 sb_download "$SUPABASE_BUCKET_JOBS" "${JOB_ID}.json" "$JOB_JSON"
 
-# Sync models and LoRAs into ComfyUI folder structure
 sync_items() {
   local key="$1"          # "models" or "loras"
   local default_bucket="$2"
@@ -213,7 +225,6 @@ sync_items "loras" "$SUPABASE_BUCKET_LORAS"
 log "Syncing models"
 sync_items "models" "$SUPABASE_BUCKET_MODELS"
 
-# Run workflow via ComfyUI API
 PROMPT_JSON="${TMP_DIR}/prompt.json"
 jq -c '.workflow' "$JOB_JSON" > "$PROMPT_JSON"
 
@@ -229,7 +240,6 @@ if [[ -z "$PROMPT_ID" || "$PROMPT_ID" == "null" ]]; then
 fi
 log "PROMPT_SUBMITTED prompt_id=$PROMPT_ID"
 
-# Wait for queue to drain (simple approach)
 log "Waiting for prompt completion"
 for i in $(seq 1 3600); do
   Q="$(curl -sS "http://127.0.0.1:${COMFYUI_PORT}/queue")"
