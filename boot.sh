@@ -1,272 +1,106 @@
 #!/usr/bin/env bash
+# boot.sh
+# Purpose:
+# - Prepare runtime dirs under /workspace/runpod-slim
+# - Ensure minimal OS tools exist
+# - Ensure ComfyUI is running (ComfyUI template usually already runs it; this script starts it if not)
+#
+# Expected to be executed from: /workspace/runpod-slim/system/boot.sh
+#
+# Requirements:
+# - LF line endings (not CRLF)
+# - bash available
+
 set -euo pipefail
-echo "BOOT_START $(date -Is)" | tee -a /workspace/runpod-slim/boot.log
-# Stateless ComfyUI boot script (fetched via curl | bash)
-# Designed for RunPod images that may auto-start ComfyUI.
-# Behavior:
-# - Detects ComfyUI location
-# - Stops any auto-started ComfyUI
-# - Updates ComfyUI repo (optional)
-# - Installs requirements into the ComfyUI venv (if present)
-# - Ensures comfyui-frontend-package is installed/upgraded
-# - Starts ComfyUI
-# - Optionally runs one JOB_ID (pull job JSON from Supabase Storage, sync assets, run workflow, upload outputs)
-#
-# REQUIRED (only if using job + storage sync):
-#   SUPABASE_URL
-#   SUPABASE_SERVICE_ROLE_KEY
-#
-# OPTIONAL:
-#   JOB_ID
-#   COMFYUI_PORT (default 8188)
-#   COMFYUI_REF  (git ref, default "master")
-#   SUPABASE_BUCKET_MODELS (default "models")
-#   SUPABASE_BUCKET_LORAS  (default "loras")
-#   SUPABASE_BUCKET_JOBS   (default "jobs")
-#   SUPABASE_BUCKET_OUTPUTS(default "outputs")
-#
-# Job JSON (Supabase Storage object: jobs/<JOB_ID>.json):
-# {
-#   "id": "job_123",
-#   "models": [{"bucket":"models","path":"checkpoints/sdxl.safetensors","target":"models/checkpoints/sdxl.safetensors"}],
-#   "loras":  [{"bucket":"loras","path":"talia.safetensors","target":"models/loras/talia.safetensors"}],
-#   "workflow": { ... ComfyUI prompt graph ... },
-#   "output_prefix": "talia_daily"
-# }
 
-log() { echo "[$(date -Is)] $*"; }
+ROOT="${ROOT:-/workspace/runpod-slim}"
+COMFY_DIR="${COMFY_DIR:-$ROOT/ComfyUI}"
+COMFY_HOST="${COMFY_HOST:-0.0.0.0}"
+COMFY_PORT="${COMFY_PORT:-8188}"
 
-log "BOOT_START $(date -Is)"
-log "BOOT_SCRIPT_URL=${BOOT_SCRIPT_URL:-}"
+LOG_DIR="$ROOT/shared/logs"
+PID_DIR="$ROOT/shared/pids"
 
-COMFYUI_PORT="${COMFYUI_PORT:-8188}"
-COMFYUI_REF="${COMFYUI_REF:-master}"
+mkdir -p \
+  "$ROOT/sfw"/{datasets,loras,outputs,workflows,tmp} \
+  "$ROOT/nsfw"/{datasets,loras,outputs,workflows,tmp} \
+  "$ROOT/shared"/{checkpoints,vae,logs,pids,tmp}
 
-SUPABASE_BUCKET_MODELS="${SUPABASE_BUCKET_MODELS:-models}"
-SUPABASE_BUCKET_LORAS="${SUPABASE_BUCKET_LORAS:-loras}"
-SUPABASE_BUCKET_JOBS="${SUPABASE_BUCKET_JOBS:-jobs}"
-SUPABASE_BUCKET_OUTPUTS="${SUPABASE_BUCKET_OUTPUTS:-outputs}"
-
-# Locate ComfyUI directory
-if [[ -d "/workspace/runpod-slim/ComfyUI" ]]; then
-  COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
-elif [[ -d "/workspace/ComfyUI" ]]; then
-  COMFYUI_DIR="/workspace/ComfyUI"
-else
-  log "ERROR: ComfyUI directory not found at /workspace/runpod-slim/ComfyUI or /workspace/ComfyUI"
-  exit 1
+# Install minimal tools (idempotent)
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -y >/dev/null
+  apt-get install -y --no-install-recommends \
+    git curl ca-certificates unzip zip jq psmisc \
+    >/dev/null
 fi
 
-# Prefer ComfyUI venv python if it exists
-if [[ -x "${COMFYUI_DIR}/.venv/bin/python" ]]; then
-  PY="${COMFYUI_DIR}/.venv/bin/python"
-else
-  PY="python3"
-fi
-
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing command: $1"; exit 1; }; }
-need_cmd curl
-need_cmd jq
-need_cmd git
-
-log "COMFYUI_DIR=$COMFYUI_DIR"
-log "PY=$PY"
-log "COMFYUI_PORT=$COMFYUI_PORT"
-log "COMFYUI_REF=$COMFYUI_REF"
-
-# Stop any auto-started ComfyUI (common in some RunPod images)
-if pgrep -f "python.*main.py" >/dev/null 2>&1; then
-  log "Detected running ComfyUI process. Stopping it to apply preflight installs."
-  pkill -f "python.*main.py" || true
-  sleep 2
-fi
-
-# Update ComfyUI repo (if it is a git repo)
-if [[ -d "${COMFYUI_DIR}/.git" ]]; then
-  log "Updating ComfyUI repo"
-  git -C "$COMFYUI_DIR" fetch --all --prune || true
-
-  if git -C "$COMFYUI_DIR" show-ref --verify --quiet "refs/heads/${COMFYUI_REF}"; then
-    git -C "$COMFYUI_DIR" checkout -f "$COMFYUI_REF"
-    git -C "$COMFYUI_DIR" pull --ff-only || true
-  else
-    # branch/tag/commit SHA
-    git -C "$COMFYUI_DIR" checkout -f "$COMFYUI_REF" || git -C "$COMFYUI_DIR" checkout -f "origin/$COMFYUI_REF"
+# If the template already has ComfyUI installed, it is typically under /workspace/ComfyUI or similar.
+# We try a few common locations and symlink to $COMFY_DIR if needed.
+if [ ! -d "$COMFY_DIR" ]; then
+  if [ -d "/workspace/ComfyUI" ]; then
+    ln -sfn "/workspace/ComfyUI" "$COMFY_DIR"
+  elif [ -d "$ROOT/comfyui" ]; then
+    ln -sfn "$ROOT/comfyui" "$COMFY_DIR"
   fi
-else
-  log "ComfyUI is not a git repo, skipping git update"
 fi
 
-# Install requirements in the same environment ComfyUI uses
-log "Installing ComfyUI requirements"
-"$PY" -m pip install -r "${COMFYUI_DIR}/requirements.txt"
+# Ensure ComfyUI models layout can reference shared checkpoints and mode-specific loras
+# Checkpoints in shared, LoRAs in ComfyUI/models/loras/{sfw,nsfw}
+if [ -d "$COMFY_DIR/models" ]; then
+  mkdir -p "$ROOT/shared/checkpoints"
+  mkdir -p "$COMFY_DIR/models/loras"/{sfw,nsfw}
 
-# Ensure the ComfyUI frontend package is installed/upgraded (frontend is a pip package now)
-log "Ensuring comfyui-frontend-package is installed"
-"$PY" -m pip install --upgrade comfyui-frontend-package
-
-# Start ComfyUI
-log "Starting ComfyUI"
-cd "$COMFYUI_DIR"
-nohup "$PY" main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" > /workspace/comfyui.log 2>&1 &
-
-# Wait for readiness
-log "Waiting for ComfyUI readiness"
-for i in $(seq 1 240); do
-  if curl -sS "http://127.0.0.1:${COMFYUI_PORT}/system_stats" >/dev/null 2>&1; then
-    log "COMFY_READY"
-    break
+  # Optional: symlink shared checkpoints
+  if [ -d "$COMFY_DIR/models/checkpoints" ]; then
+    rm -rf "$COMFY_DIR/models/checkpoints"
   fi
-  sleep 1
-done
+  ln -sfn "$ROOT/shared/checkpoints" "$COMFY_DIR/models/checkpoints"
 
-if ! curl -sS "http://127.0.0.1:${COMFYUI_PORT}/system_stats" >/dev/null 2>&1; then
-  log "ERROR: ComfyUI did not become ready. Last log lines:"
-  tail -n 200 /workspace/comfyui.log || true
-  exit 1
+  # Symlink per-mode loras into ComfyUI selector paths
+  ln -sfn "$ROOT/sfw/loras"  "$COMFY_DIR/models/loras/sfw"
+  ln -sfn "$ROOT/nsfw/loras" "$COMFY_DIR/models/loras/nsfw"
 fi
 
-# If no job requested, stop here
-JOB_ID="${JOB_ID:-}"
-if [[ -z "$JOB_ID" ]]; then
-  log "No JOB_ID provided. Boot completed."
-  exit 0
-fi
-
-# Supabase required if JOB_ID is set
-if [[ -z "${SUPABASE_URL:-}" || -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
-  log "ERROR: JOB_ID is set but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are missing"
-  exit 1
-fi
-
-SUPABASE_URL="${SUPABASE_URL%/}"
-SUPABASE_STORAGE="${SUPABASE_URL}/storage/v1"
-
-sb_create_signed_url() {
-  local bucket="$1"
-  local object_path="$2"
-  local expires="${3:-3600}"
-
-  curl -sS -X POST \
-    -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-    -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-    -H "Content-Type: application/json" \
-    "${SUPABASE_STORAGE}/object/sign/${bucket}/${object_path}" \
-    -d "{\"expiresIn\": ${expires}}" \
-  | jq -r '.signedURL'
+# Start ComfyUI only if not already listening
+is_listening() {
+  curl -fsS "http://127.0.0.1:${COMFY_PORT}/" >/dev/null 2>&1
 }
 
-sb_download() {
-  local bucket="$1"
-  local object_path="$2"
-  local dest="$3"
-
-  mkdir -p "$(dirname "$dest")"
-
-  local signed
-  signed="$(sb_create_signed_url "$bucket" "$object_path" 3600)"
-  if [[ -z "$signed" || "$signed" == "null" ]]; then
-    log "ERROR: failed to create signed URL for ${bucket}/${object_path}"
+start_comfyui() {
+  if [ ! -d "$COMFY_DIR" ]; then
+    echo "ERROR: ComfyUI directory not found at $COMFY_DIR" >&2
     exit 1
   fi
 
-  local url="${SUPABASE_URL}${signed}"
-  log "Downloading ${bucket}/${object_path} -> $dest"
-  curl -L --fail -o "$dest" "$url"
+  mkdir -p "$LOG_DIR" "$PID_DIR"
+
+  echo "Starting ComfyUI on ${COMFY_HOST}:${COMFY_PORT} ..."
+  nohup python3 "$COMFY_DIR/main.py" \
+    --listen "$COMFY_HOST" \
+    --port "$COMFY_PORT" \
+    > "$LOG_DIR/comfyui.log" 2>&1 &
+
+  echo $! > "$PID_DIR/comfyui.pid"
 }
 
-sb_upload() {
-  local bucket="$1"
-  local object_path="$2"
-  local file="$3"
+if is_listening; then
+  echo "ComfyUI already running on port $COMFY_PORT"
+else
+  start_comfyui
 
-  log "Uploading $file -> ${bucket}/${object_path}"
-  curl -sS --fail -X POST \
-    -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-    -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-    -H "Content-Type: application/octet-stream" \
-    -H "x-upsert: true" \
-    --data-binary @"$file" \
-    "${SUPABASE_STORAGE}/object/${bucket}/${object_path}" >/dev/null
-}
-
-TMP_DIR="$(mktemp -d)"
-JOB_JSON="${TMP_DIR}/job.json"
-
-log "Fetching job: ${SUPABASE_BUCKET_JOBS}/${JOB_ID}.json"
-sb_download "$SUPABASE_BUCKET_JOBS" "${JOB_ID}.json" "$JOB_JSON"
-
-sync_items() {
-  local key="$1"          # "models" or "loras"
-  local default_bucket="$2"
-
-  jq -c ".${key}[]? // empty" "$JOB_JSON" | while read -r item; do
-    local bucket path target dest
-    bucket="$(echo "$item" | jq -r '.bucket // empty')"
-    path="$(echo "$item" | jq -r '.path')"
-    target="$(echo "$item" | jq -r '.target')"
-
-    if [[ -z "$bucket" ]]; then
-      bucket="$default_bucket"
+  # Wait up to 90 seconds for ComfyUI to come up
+  for i in $(seq 1 90); do
+    if is_listening; then
+      echo "ComfyUI is ready"
+      break
     fi
-
-    dest="${COMFYUI_DIR}/${target}"
-    if [[ -f "$dest" ]]; then
-      log "Exists, skip: $dest"
-    else
-      sb_download "$bucket" "$path" "$dest"
-    fi
+    sleep 1
   done
-}
 
-log "Syncing LoRAs"
-sync_items "loras" "$SUPABASE_BUCKET_LORAS"
-
-log "Syncing models"
-sync_items "models" "$SUPABASE_BUCKET_MODELS"
-
-PROMPT_JSON="${TMP_DIR}/prompt.json"
-jq -c '.workflow' "$JOB_JSON" > "$PROMPT_JSON"
-
-log "Submitting prompt"
-RESP="$(curl -sS --fail -X POST "http://127.0.0.1:${COMFYUI_PORT}/prompt" \
-  -H "Content-Type: application/json" \
-  -d "{\"prompt\": $(cat "$PROMPT_JSON") }")"
-
-PROMPT_ID="$(echo "$RESP" | jq -r '.prompt_id')"
-if [[ -z "$PROMPT_ID" || "$PROMPT_ID" == "null" ]]; then
-  log "ERROR: prompt submit failed: $RESP"
-  exit 1
-fi
-log "PROMPT_SUBMITTED prompt_id=$PROMPT_ID"
-
-log "Waiting for prompt completion"
-for i in $(seq 1 3600); do
-  Q="$(curl -sS "http://127.0.0.1:${COMFYUI_PORT}/queue")"
-  RUNNING="$(echo "$Q" | jq -r '.queue_running | length')"
-  PENDING="$(echo "$Q" | jq -r '.queue_pending | length')"
-  if [[ "$RUNNING" == "0" && "$PENDING" == "0" ]]; then
-    break
+  if ! is_listening; then
+    echo "ERROR: ComfyUI did not become ready. Check $LOG_DIR/comfyui.log" >&2
+    exit 1
   fi
-  sleep 2
-done
-
-OUT_DIR="${COMFYUI_DIR}/output"
-if [[ ! -d "$OUT_DIR" ]]; then
-  log "ERROR: output dir not found: $OUT_DIR"
-  exit 1
 fi
 
-OUTPUT_PREFIX="$(jq -r '.output_prefix // "outputs"' "$JOB_JSON")"
-RUN_TS="$(date +%Y%m%d_%H%M%S)"
-REMOTE_DIR="${OUTPUT_PREFIX}/${JOB_ID}/${PROMPT_ID}_${RUN_TS}"
-
-log "Uploading outputs to ${SUPABASE_BUCKET_OUTPUTS}/${REMOTE_DIR}"
-shopt -s nullglob
-for f in "${OUT_DIR}"/*; do
-  base="$(basename "$f")"
-  sb_upload "$SUPABASE_BUCKET_OUTPUTS" "${REMOTE_DIR}/${base}" "$f"
-done
-
-log "JOB_DONE remote=${SUPABASE_BUCKET_OUTPUTS}/${REMOTE_DIR}"
-exit 0
+echo "BOOT_OK"
