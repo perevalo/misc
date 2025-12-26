@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+echo "BOOT_START $(date -Is)" | tee -a /workspace/runpod-slim/boot.log
 # Stateless ComfyUI boot script (fetched via curl | bash)
 # Designed for RunPod images that may auto-start ComfyUI.
 # Behavior:
